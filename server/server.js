@@ -9,8 +9,8 @@ import morgan from "morgan";
 import { z } from "zod";
 
 /* -------------------------
-   Force-load .env from THIS folder
-   AND override Windows user env vars
+   Load .env from server folder
+   AND override Windows user env vars (your exact issue)
 ------------------------- */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,18 +18,45 @@ dotenv.config({ path: path.join(__dirname, ".env"), override: true });
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-app.use(cors({ origin: "http://localhost:5173" }));
 app.use(helmet());
 app.use(morgan("dev"));
 
+/* -------------------------
+   Config
+------------------------- */
 const PORT = Number(process.env.PORT || 5051);
 const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 const KEY = process.env.GEMINI_API_KEY || "";
 
-// normalize: allow GEMINI_MODEL=models/xxx OR gemini-xxx
+// Normalize: allow GEMINI_MODEL=models/xxx OR gemini-xxx
 const MODEL = RAW_MODEL.startsWith("models/")
   ? RAW_MODEL.replace("models/", "")
   : RAW_MODEL;
+
+// CORS: allow local + your Netlify domain (set FRONTEND_URL on Render)
+const allowedOrigins = [
+  "http://localhost:5173",
+  process.env.FRONTEND_URL, // e.g. https://your-site.netlify.app
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // allow non-browser tools (no origin)
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+
+      return callback(
+        new Error(
+          `CORS blocked. Origin not allowed: ${origin}. Allowed: ${allowedOrigins.join(
+            ", "
+          )}`
+        )
+      );
+    },
+  })
+);
 
 console.log("✅ Server booting...");
 console.log("🤖 Gemini model:", MODEL);
@@ -37,9 +64,10 @@ console.log("📄 Loaded env from:", path.join(__dirname, ".env"));
 console.log("🔑 GEMINI_API_KEY loaded?", KEY.length > 0);
 console.log("🔑 KEY prefix:", KEY ? KEY.slice(0, 6) : "(missing)");
 console.log("🔑 KEY suffix:", KEY ? KEY.slice(-4) : "(missing)");
+console.log("🌐 FRONTEND_URL:", process.env.FRONTEND_URL || "(not set yet)");
 
 if (!KEY) {
-  console.error("❌ Missing GEMINI_API_KEY in server/.env");
+  console.error("❌ Missing GEMINI_API_KEY in server/.env or Render env vars.");
   process.exit(1);
 }
 
@@ -51,9 +79,10 @@ const AnalyzeSchema = z.object({
   issueType: z.string().min(1),
   bookingTotal: z.number().nullable().optional(),
   refundedAmount: z.number().nullable().optional(),
-// NEW:
-  encouragedRefundCapPercent: z.number().default(15),
-  maxRefundCapPercent: z.number().default(20),
+
+  // NEW POLICY:
+  encouragedRefundCapPercent: z.number().default(15), // encouraged max
+  maxRefundCapPercent: z.number().default(20), // allowed max for agents
 });
 
 function computeRefundPercent(total, refunded) {
@@ -70,8 +99,9 @@ You are a Refund & Chargeback Risk Predictor for a travel call center.
 
 POLICY (NON-NEGOTIABLE):
 - Encouraged refund cap: ${input.encouragedRefundCapPercent}% (try to stay at or under this)
-- Maximum agent refund cap: ${input.maxRefundCapPercent}% (over this requires manager escalation)
-- If refund is between ${input.encouragedRefundCapPercent}% and ${input.maxRefundCapPercent}%, treat as HIGH scrutiny and recommend escalation.
+- Maximum agent refund cap: ${input.maxRefundCapPercent}% (agents may refund up to this, but it should trigger escalation)
+- If refund percent is between ${input.encouragedRefundCapPercent}% and ${input.maxRefundCapPercent}%, treat as HIGH scrutiny and recommend escalation/manager review.
+- If refund percent is above ${input.maxRefundCapPercent}%, label it as a POLICY VIOLATION and recommend immediate manager escalation.
 - Never promise refunds, approvals, or free upgrades.
 
 Return ONLY valid JSON with this exact shape:
@@ -85,8 +115,19 @@ Return ONLY valid JSON with this exact shape:
   "warnings": [string],
   "recommended_script": [string],
   "next_steps": [string],
-  "missing_info": [string]
+  "missing_info": [string],
+  "policy": {
+    "encouraged_cap_percent": number,
+    "max_cap_percent": number,
+    "refund_percent": number | null,
+    "soft_cap_exceeded": boolean,
+    "hard_cap_exceeded": boolean
+  }
 }
+
+RISK GUIDELINES:
+- Sales error/misrepresentation claims, billing discrepancies, angry disconnects, hotel unreachable => increase risk
+- Missing info => reduce confidence and request clarification
 
 INPUTS:
 Issue Type: ${input.issueType}
@@ -102,7 +143,7 @@ ${input.rawNotes}
 }
 
 /* -------------------------
-   Gemini REST call (no SDK)
+   Gemini REST call (matches your working PowerShell test)
 ------------------------- */
 async function geminiGenerateJson(prompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -111,38 +152,32 @@ async function geminiGenerateJson(prompt) {
 
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.2, responseMimeType: "application/json" }
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+    },
   };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
   const raw = await resp.text();
 
   if (!resp.ok) {
-    // return Google raw error
+    // pass Google raw error up to client
     throw new Error(raw);
   }
 
   const json = JSON.parse(raw);
-
   const modelText = json?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
   if (!modelText) throw new Error("No model text returned");
 
-  // responseMimeType should return pure JSON, but keep safe fallback
-  try {
-    return JSON.parse(modelText);
-  } catch {
-    const start = modelText.indexOf("{");
-    const end = modelText.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) {
-      throw new Error("Model did not return JSON");
-    }
-    return JSON.parse(modelText.slice(start, end + 1));
-  }
+  // Should already be JSON due to responseMimeType
+  return JSON.parse(modelText);
 }
 
 /* -------------------------
@@ -164,9 +199,30 @@ app.get("/debug/gemini", async (req, res) => {
 app.post("/api/analyze", async (req, res) => {
   try {
     const input = AnalyzeSchema.parse(req.body);
+
+    const refundPercent = computeRefundPercent(input.bookingTotal, input.refundedAmount);
+    const softCapExceeded =
+      refundPercent != null && refundPercent > input.encouragedRefundCapPercent;
+    const hardCapExceeded =
+      refundPercent != null && refundPercent > input.maxRefundCapPercent;
+
     const prompt = buildPrompt(input);
     const data = await geminiGenerateJson(prompt);
-    res.json(data);
+
+    // Ensure policy object is present even if model forgets
+    const merged = {
+      ...data,
+      policy: {
+        encouraged_cap_percent: input.encouragedRefundCapPercent,
+        max_cap_percent: input.maxRefundCapPercent,
+        refund_percent: refundPercent,
+        soft_cap_exceeded: softCapExceeded,
+        hard_cap_exceeded: hardCapExceeded,
+        ...(data?.policy || {}),
+      },
+    };
+
+    res.json(merged);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
     console.error("❌ Analyze error:", msg);
